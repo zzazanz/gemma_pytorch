@@ -39,7 +39,7 @@ class Sampler(nn.Module):
         top_ps: torch.Tensor,
         top_ks: torch.Tensor,
         embedding_bias: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         # Select the last element for each sequence.
         # (batch_size, input_len, hidden_size) -> (batch_size, hidden_size)
         hidden_states = hidden_states.index_select(
@@ -49,7 +49,7 @@ class Sampler(nn.Module):
             logits += embedding_bias
 
         if temperatures is None:
-            return torch.argmax(logits, dim=-1).squeeze(dim=-1), logits
+            return torch.argmax(logits, dim=-1).squeeze(dim=-1)
 
         # Apply temperature scaling.
         logits.div_(temperatures.unsqueeze(dim=1))
@@ -78,7 +78,7 @@ class Sampler(nn.Module):
         next_token_ids = torch.multinomial(probs,
                                            num_samples=1,
                                            replacement=True).squeeze(dim=-1)
-        return next_token_ids, logits
+        return next_token_ids
 
 
 def precompute_freqs_cis(dim: int,
@@ -339,15 +339,17 @@ class GemmaDecoderLayer(nn.Module):
             kv_cache=kv_cache,
             mask=mask,
         )
+        attn = hidden_states
         hidden_states = residual + hidden_states
 
         # MLP
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        mlp = hidden_states
         hidden_states = residual + hidden_states
 
-        return hidden_states
+        return hidden_states, attn, mlp
 
 
 class GemmaModel(nn.Module):
@@ -370,17 +372,21 @@ class GemmaModel(nn.Module):
         kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
         mask: torch.Tensor,
     ) -> torch.Tensor:
+        attn_list = []
+        mlp_list = []
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states = layer(
+            hidden_states, attn, mlp = layer(
                 hidden_states=hidden_states,
                 freqs_cis=freqs_cis,
                 kv_write_indices=kv_write_indices,
                 kv_cache=kv_caches[i],
                 mask=mask,
             )
+            attn_list.append(attn)
+            mlp_list.append(mlp)
         hidden_states = self.norm(hidden_states)
-        return hidden_states
+        return hidden_states, attn_list, mlp_list
 
 
 class GemmaForCausalLM(nn.Module):
@@ -422,7 +428,7 @@ class GemmaForCausalLM(nn.Module):
         top_ps: torch.Tensor,
         top_ks: torch.Tensor,
         **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         freqs_cis = self.freqs_cis.index_select(0, input_positions)
         kv_write_indices = input_positions
 
@@ -431,7 +437,7 @@ class GemmaForCausalLM(nn.Module):
         # Gemma normalizes the embedding by sqrt(hidden_size).
         hidden_states = hidden_states * (self.config.hidden_size**0.5)
 
-        hidden_states = self.model(
+        hidden_states, attn_list, mlp_list = self.model(
             hidden_states=hidden_states,
             freqs_cis=freqs_cis,
             kv_write_indices=kv_write_indices,
@@ -442,7 +448,7 @@ class GemmaForCausalLM(nn.Module):
         if self.config.quant:
             embedder_weight = (
                 embedder_weight * self.embedder.weight_scaler.unsqueeze(-1))
-        next_tokens, logits = self.sampler(
+        next_tokens = self.sampler(
             embedding=embedder_weight,
             hidden_states=hidden_states,
             output_positions=output_positions,
@@ -450,7 +456,7 @@ class GemmaForCausalLM(nn.Module):
             top_ps=top_ps,
             top_ks=top_ks,
         )
-        return next_tokens, logits
+        return next_tokens, attn_list, mlp_list
 
     def generate(
         self,
@@ -515,7 +521,7 @@ class GemmaForCausalLM(nn.Module):
         # Prefill up to min_prompt_len tokens, then treat other prefill as
         # decode and ignore output.
         for i in range(max_seq_len - min_prompt_len):
-            next_token_ids, _ = self(
+            next_token_ids, attn_list, mlp_list = self(
                 input_token_ids=input_token_ids_tensor,
                 input_positions=input_positions_tensor,
                 kv_write_indices=None,
@@ -555,7 +561,7 @@ class GemmaForCausalLM(nn.Module):
             results.append(self.tokenizer.decode(trimmed_output))
 
         # If a string was provided as input, return a string as output.
-        return results[0] if is_str_prompt else results
+        return results[0] if is_str_prompt else results, attn_list, mlp_list
 
     def load_weights(self, model_path: str):
         self.load_state_dict(
